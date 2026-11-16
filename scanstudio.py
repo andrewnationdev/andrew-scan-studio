@@ -50,6 +50,43 @@ def crop_oriented_rect(img_np, center, size, angle):
     return cropped
 
 
+def rect_from_four_points(points):
+    """Converte 4 pontos (x, y) clicados nos cantos em (cx, cy, w, h, angle)."""
+    pts = np.array(points, dtype=np.float32)
+    s = pts.sum(axis=1)
+    tl_idx = int(np.argmin(s))
+    br_idx = int(np.argmax(s))
+    if tl_idx == br_idx:
+        br_idx = (tl_idx + 1) % 4
+
+    rem = [i for i in range(4) if i not in (tl_idx, br_idx)]
+    diffs = [pts[i][1] - pts[i][0] for i in rem]
+    if diffs[0] <= diffs[1]:
+        tr_idx, bl_idx = rem[0], rem[1]
+    else:
+        tr_idx, bl_idx = rem[1], rem[0]
+
+    tl, tr, br, bl = pts[tl_idx], pts[tr_idx], pts[br_idx], pts[bl_idx]
+
+    cx = float(pts[:, 0].mean())
+    cy = float(pts[:, 1].mean())
+
+    # Vetor médio horizontal (topo e base) define o ângulo de inclinação
+    vx = ((tr[0] - tl[0]) + (br[0] - bl[0])) / 2.0
+    vy = ((tr[1] - tl[1]) + (br[1] - bl[1])) / 2.0
+    angle = round(math.degrees(math.atan2(vy, vx)), 1)
+
+    w_top = math.hypot(tr[0] - tl[0], tr[1] - tl[1])
+    w_bot = math.hypot(br[0] - bl[0], br[1] - bl[1])
+    h_left = math.hypot(bl[0] - tl[0], bl[1] - tl[1])
+    h_right = math.hypot(br[0] - tr[0], br[1] - tr[1])
+
+    w = max(10.0, float((w_top + w_bot) / 2.0))
+    h = max(10.0, float((h_left + h_right) / 2.0))
+
+    return cx, cy, w, h, angle
+
+
 class BatchRenameDialog(QDialog):
     """Diálogo para configurar a renomeação automática em lote."""
     def __init__(self, parent=None, current_page_idx=0, total_pages=1):
@@ -121,6 +158,7 @@ class ImageCanvas(QWidget):
     region_added = pyqtSignal()
     region_updated = pyqtSignal()
     zoom_changed = pyqtSignal(float)
+    points_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -133,6 +171,10 @@ class ImageCanvas(QWidget):
         self.zoom_level = 1.0
         self.scale_factor = 1.0
 
+        self.selection_mode = 'RECT'  # 'RECT' ou '4POINTS'
+        self.four_points = []  # Lista de tuplas (x, y) em coordenadas da imagem
+        self.hover_img_pos = None
+
         self.is_drawing = False
         self.drag_mode = None  # 'MOVE', 'ROTATE', 'RESIZE_TL', 'RESIZE_TR', 'RESIZE_BR', 'RESIZE_BL'
         self.drag_start_mouse = QPointF()
@@ -140,9 +182,24 @@ class ImageCanvas(QWidget):
 
         self.setMouseTracking(True)
 
+    def set_selection_mode(self, mode):
+        self.selection_mode = mode
+        self.four_points.clear()
+        self.is_drawing = False
+        self.drag_mode = None
+        self.points_changed.emit(0)
+        self.setCursor(Qt.CrossCursor)
+        self.update()
+
+    def clear_pending_points(self):
+        self.four_points.clear()
+        self.points_changed.emit(0)
+        self.update()
+
     def set_image(self, img_np, page_num):
         self.image_np = img_np
         self.current_page = page_num
+        self.clear_pending_points()
         h, w, ch = img_np.shape
         bytes_per_line = ch * w
         q_img = QImage(img_np.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -224,19 +281,57 @@ class ImageCanvas(QWidget):
         return None
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton or not self.pixmap:
+        if not self.pixmap:
+            return
+
+        # Botão direito desfaz o último ponto no modo 4 cantos
+        if event.button() == Qt.RightButton and self.selection_mode == '4POINTS':
+            if self.four_points:
+                self.four_points.pop()
+                self.points_changed.emit(len(self.four_points))
+                self.update()
+            return
+
+        if event.button() != Qt.LeftButton:
             return
 
         mouse_disp = event.pos()
         mouse_img = mouse_disp / self.scale_factor
 
-        handle_type = self.hit_test_handle(mouse_disp)
-        if handle_type:
-            self.drag_mode = handle_type
-            self.drag_start_mouse = mouse_img
-            self.drag_start_region = dict(self.regions[self.selected_index])
+        # 1. Permitir arrastar alças da seleção atual em qualquer modo (desde que não haja pontos pendentes)
+        if not self.four_points:
+            handle_type = self.hit_test_handle(mouse_disp)
+            if handle_type:
+                self.drag_mode = handle_type
+                self.drag_start_mouse = mouse_img
+                self.drag_start_region = dict(self.regions[self.selected_index])
+                return
+
+        # 2. Lógica específica do Modo 4 Cantos
+        if self.selection_mode == '4POINTS':
+            self.four_points.append((mouse_img.x(), mouse_img.y()))
+            self.points_changed.emit(len(self.four_points))
+
+            if len(self.four_points) == 4:
+                cx, cy, w, h, angle = rect_from_four_points(self.four_points)
+                region_num = len(self.regions) + 1
+                new_region = {
+                    'cx': cx, 'cy': cy,
+                    'w': w, 'h': h,
+                    'angle': angle,
+                    'name': f'recorte_p{self.current_page + 1}_{region_num}',
+                    'page': self.current_page
+                }
+                self.regions.append(new_region)
+                self.selected_index = len(self.regions) - 1
+                self.four_points.clear()
+                self.points_changed.emit(0)
+                self.region_added.emit()
+
+            self.update()
             return
 
+        # 3. Lógica do Modo Retângulo Padrão: mover região existente ou iniciar desenho
         clicked_idx = self.get_region_at(mouse_img.x(), mouse_img.y())
         if clicked_idx != -1:
             self.selected_index = clicked_idx
@@ -254,6 +349,18 @@ class ImageCanvas(QWidget):
     def mouseMoveEvent(self, event):
         mouse_disp = event.pos()
         mouse_img = mouse_disp / self.scale_factor
+        self.hover_img_pos = mouse_img
+
+        if self.selection_mode == '4POINTS':
+            if not self.four_points and self.hit_test_handle(mouse_disp):
+                handle = self.hit_test_handle(mouse_disp)
+                self.setCursor(Qt.PointingHandCursor if handle == 'ROTATE' else Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CrossCursor)
+            if self.four_points:
+                self.update()
+            if not self.drag_mode:
+                return
 
         if not self.drag_mode and not self.is_drawing:
             handle = self.hit_test_handle(mouse_disp)
@@ -372,7 +479,7 @@ class ImageCanvas(QWidget):
                     self.region_added.emit()
 
             self.drag_mode = None
-            self.setCursor(Qt.ArrowCursor)
+            self.setCursor(Qt.CrossCursor if self.selection_mode == '4POINTS' else Qt.ArrowCursor)
             self.update()
 
     def get_region_at(self, x, y):
@@ -439,6 +546,33 @@ class ImageCanvas(QWidget):
                     pt = handles[key]
                     painter.drawRect(QRectF(pt.x() - 4, pt.y() - 4, 8, 8))
 
+        # Desenho das marcações parciais no Modo 4 Cantos
+        if self.selection_mode == '4POINTS' and self.four_points:
+            disp_pts = [QPointF(px * self.scale_factor, py * self.scale_factor) for px, py in self.four_points]
+
+            # Linhas conectando os pontos já clicados
+            painter.setPen(QPen(QColor(255, 140, 0), 2, Qt.SolidLine))
+            for i in range(len(disp_pts) - 1):
+                painter.drawLine(disp_pts[i], disp_pts[i + 1])
+
+            # Linha guia pontilhada até o cursor atual
+            if self.hover_img_pos is not None:
+                cursor_disp = QPointF(self.hover_img_pos.x() * self.scale_factor,
+                                      self.hover_img_pos.y() * self.scale_factor)
+                painter.setPen(QPen(QColor(255, 140, 0), 1, Qt.DashLine))
+                painter.drawLine(disp_pts[-1], cursor_disp)
+                if len(disp_pts) == 3:
+                    painter.drawLine(cursor_disp, disp_pts[0])
+
+            # Marcadores numerados em cada vértice
+            for i, pt in enumerate(disp_pts):
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+                painter.setBrush(QColor(255, 111, 0))
+                painter.drawEllipse(pt, 6, 6)
+                painter.setPen(QPen(QColor(255, 235, 59), 2))
+                painter.drawText(int(pt.x() + 9), int(pt.y() - 6), f"P{i + 1}")
+
+        # Desenho temporário no Modo Retângulo Padrão
         if self.is_drawing:
             pen = QPen(QColor(0, 150, 255), 2, Qt.DashLine)
             painter.setPen(pen)
@@ -496,8 +630,24 @@ class MainWindow(QMainWindow):
 
         left_layout.addLayout(top_bar_1)
 
-        # Barra 2: Rotações de Página e Zoom
+        # Barra 2: Modo de Seleção, Rotações de Página e Zoom
         top_bar_2 = QHBoxLayout()
+
+        self.btn_mode_rect = QPushButton("▭ Arrastar Caixa")
+        self.btn_mode_rect.setCheckable(True)
+        self.btn_mode_rect.setChecked(True)
+        self.btn_mode_rect.clicked.connect(lambda: self.switch_selection_mode('RECT'))
+        top_bar_2.addWidget(self.btn_mode_rect)
+
+        self.btn_mode_4pts = QPushButton("📍 Marcar 4 Cantos")
+        self.btn_mode_4pts.setCheckable(True)
+        self.btn_mode_4pts.clicked.connect(lambda: self.switch_selection_mode('4POINTS'))
+        top_bar_2.addWidget(self.btn_mode_4pts)
+
+        self.lbl_mode_hint = QLabel("")
+        self.lbl_mode_hint.setStyleSheet("color: #E65100; font-weight: bold;")
+        top_bar_2.addWidget(self.lbl_mode_hint)
+
         self.btn_rot_ccw = QPushButton("↺ 90° Anti-horário")
         self.btn_rot_ccw.clicked.connect(lambda: self.rotate_current_page('ccw'))
         top_bar_2.addWidget(self.btn_rot_ccw)
@@ -531,6 +681,7 @@ class MainWindow(QMainWindow):
         self.canvas.region_added.connect(self.sync_region_list)
         self.canvas.region_updated.connect(self.populate_controls)
         self.canvas.zoom_changed.connect(self.update_zoom_label)
+        self.canvas.points_changed.connect(self.update_points_hint)
 
         scroll_area = QScrollArea()
         scroll_area.setWidget(self.canvas)
@@ -598,6 +749,22 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(group_export)
 
         main_layout.addLayout(right_layout, stretch=1)
+        self.switch_selection_mode('RECT')
+
+    def switch_selection_mode(self, mode):
+        is_4pts = (mode == '4POINTS')
+        self.btn_mode_rect.setChecked(not is_4pts)
+        self.btn_mode_4pts.setChecked(is_4pts)
+        self.btn_mode_rect.setStyleSheet("font-weight: bold; background-color: #BBDEFB;" if not is_4pts else "")
+        self.btn_mode_4pts.setStyleSheet("font-weight: bold; background-color: #FFE0B2;" if is_4pts else "")
+        self.canvas.set_selection_mode(mode)
+        self.update_points_hint(0)
+
+    def update_points_hint(self, count):
+        if self.canvas.selection_mode == '4POINTS':
+            self.lbl_mode_hint.setText(f"[{count}/4 cantos | Botão dir. desfaz]")
+        else:
+            self.lbl_mode_hint.setText("")
 
     def update_zoom_label(self, val):
         self.lbl_zoom.setText(f"{int(val * 100)}%")
@@ -845,7 +1012,6 @@ class MainWindow(QMainWindow):
         if not export_dir:
             return
 
-        # Obter extensão selecionada pelo usuário (.jpg, .png, .webp)
         fmt_text = self.combo_format.currentText()
         ext = fmt_text.split("(")[1].replace(")", "").strip()
 
@@ -866,10 +1032,9 @@ class MainWindow(QMainWindow):
             
             cropped_bgr = cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR)
 
-            # Parâmetros de qualidade de salvamento
             params = []
             if ext in ['.jpg', '.jpeg']:
-                params = [int(cv2.IMWRITE_JPEG_QUALITY), 95]  # Alta qualidade JPG
+                params = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
 
             cv2.imwrite(save_path, cropped_bgr, params)
             saved_count += 1
